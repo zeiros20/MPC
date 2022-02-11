@@ -193,7 +193,7 @@ def Mace(x_init, y_init, theta_init, x_target, y_target, theta_target, switch_po
             t0, state_init, u0 = shift_timestep(h, t0, state_init, u, f)
 
             print(X0)
-            pos = int(X0[1, 1])
+            pos = int(X0[1, 0])
             X0 = ca.horzcat(
                 X0[:, 1:],
                 ca.reshape(X0[:, -1], -1, 1)
@@ -419,15 +419,15 @@ def Diff(x_init, y_init, theta_init, x_target, y_target, theta_target, cat_state
 target_telta= 1
 target_x = 15
 target_y = 15
-X = Mace(0,0,0,15,15,0,12)
+X = Mace(0,0,0,15,15,0,5)
 Dx_init = float(X[0][0,0])
 print(Dx_init)
 Dy_init = float(X[0][1,0])
 print(Dy_init)
 Dth_init = float(X[0][2,0])
 target_theta = (arctan((15-Dy_init)/(15-Dx_init)))
-stl_x = 14/(math.tan(target_theta))
-print(tan(target_theta))
+stl_x = (14-5)/(math.tan(target_theta))
+print(target_theta)
 print(stl_x)
 
 print(target_theta)
