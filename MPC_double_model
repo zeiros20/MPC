@@ -1,0 +1,435 @@
+import casadi as ca
+from casadi import *
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from Sim_code import simulate
+from time import time
+
+
+def Mace(x_init, y_init, theta_init, x_target, y_target, theta_target, switch_pos):
+    def shift_timestep(step_horizon, t0, state_init, u, f):
+        f_value = f(state_init, u[:, 0])
+        next_state = ca.DM.full(state_init + (step_horizon * f_value))
+
+        t0 = t0 + step_horizon
+        u0 = ca.horzcat(
+            u[:, 1:],
+            ca.reshape(u[:, -1], -1, 1)
+        )
+
+        return t0, next_state, u0
+
+    def DM2Arr(dm):
+        return np.array(dm.full())
+
+    # weights
+    Q_X = 9
+    Q_Y = 7
+    Q_theta = 1
+    R_w1 = 0.05
+    R_w2 = 0.05
+    R_w3 = 0.05
+    R_w4 = 0.05
+
+    # MPC CUs
+    h = 0.2
+    N = 20
+    state_init = ca.DM([x_init, y_init, theta_init])  # initial state
+    state_target = ca.DM([x_target, y_target, theta_target])  # target state
+
+    # Robot char
+    rob_diam = 0.3
+    Rw = 0.1
+    L = 0.2
+    l = 0.1
+
+    # input constrains
+    omega_max = math.pi
+    omega_min = -omega_max
+
+    x = ca.SX.sym('x')
+    y = ca.SX.sym('y')
+    theta = ca.SX.sym('theta')
+    states = ca.vertcat(x, y, theta)
+    n_states = states.numel()
+
+    omega_w1 = ca.SX.sym('omega_w1')
+    omega_w2 = ca.SX.sym('omega_w2')
+    omega_w3 = ca.SX.sym('omega_w3')
+    omega_w4 = ca.SX.sym('omega_w4')
+    controls = ca.vertcat(omega_w1, omega_w2, omega_w3, omega_w4)
+    n_controls = controls.numel()
+
+    # discretization model
+    rot_3d_z = ca.vertcat(
+        ca.horzcat(cos(theta), -sin(theta), 0),
+        ca.horzcat(sin(theta), cos(theta), 0),
+        ca.horzcat(0, 0, 1)
+    )
+    j0_plus = (Rw / 4) * ca.DM([
+        [1, 1, 1, 1],
+        [-1, 1, 1, -1],
+        [-1 / (L + l), 1 / (L + l), -1 / (L + l), 1 / (L + l)]
+    ])
+    rhs = rot_3d_z @ j0_plus @ controls
+    # --------------------------------------------------------------------
+
+    f = ca.Function('f', [states, controls], [rhs])
+    X = ca.SX.sym('X', n_states, (N + 1))
+    U = ca.SX.sym('U', n_controls, N)
+    P = ca.SX.sym('P', n_states + n_states)
+
+    obj = 0
+    g = X[:, 0] - P[:n_states]
+
+    # calculating objective and manage constrains
+    Q = diagcat(Q_X, Q_Y, Q_theta)
+    R = diagcat(R_w1, R_w2, R_w3, R_w4)
+    for k in range(N):
+        st = X[:, k]
+        con = U[:, k]
+        obj = obj + (st - P[n_states:]).T @ Q @ (st - P[n_states:]) + con.T @ R @ con
+        st_next = X[:, k + 1]
+        k1 = f(st, con)
+        k2 = f(st + h / 2 * k1, con)
+        k3 = f(st + h / 2 * k2, con)
+        k4 = f(st + h * k3, con)
+        st_next_RK4 = st + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        g = ca.vertcat(g, st_next - st_next_RK4)
+
+    # Gathering optmization variables
+    OPT_variables = ca.vertcat(ca.reshape(X, n_states * (N + 1), 1), ca.reshape(U, n_controls * N, 1))
+
+    nlp_prob = {'f': obj, 'x': OPT_variables, 'g': g, 'p': P}
+    # f: objective eqn
+    # x: optmization variables
+    # g: constrains 1
+    # p: output parameters (constrains 2)
+
+    opts = {
+        'ipopt': {
+            'max_iter': 2000,
+            'print_level': 0,
+            'acceptable_tol': 1e-8,
+            'acceptable_obj_change_tol': 1e-6
+        },
+        'print_time': 0
+    }
+
+    solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts)
+
+    lbx = ca.DM.zeros((n_states * (N + 1) + n_controls * N, 1))
+    ubx = ca.DM.zeros((n_states * (N + 1) + n_controls * N, 1))
+
+    lbx[0: n_states * (N + 1): n_states] = -ca.inf
+    lbx[1: n_states * (N + 1): n_states] = -ca.inf
+    lbx[2: n_states * (N + 1): n_states] = -ca.inf
+
+    ubx[0: n_states * (N + 1): n_states] = ca.inf
+    ubx[1: n_states * (N + 1): n_states] = ca.inf
+    ubx[2: n_states * (N + 1): n_states] = ca.inf
+
+    lbx[n_states * (N + 1):] = omega_min
+    ubx[n_states * (N + 1):] = omega_max
+
+    args = dict(lbg=ca.DM.zeros((n_states * (N + 1), 1)), ubg=ca.DM.zeros((n_states * (N + 1), 1)), lbx=lbx, ubx=ubx)
+
+    t0 = 0
+    t = ca.DM(t0)
+    u0 = ca.DM.zeros((n_controls, N))  # initial control
+    X0 = ca.repmat(state_init, 1, N + 1)  # initial state full
+
+    mpc_iter = 0
+    cat_states = DM2Arr(X0)
+    cat_controls = DM2Arr(u0[:, 0])
+    times = np.array([[0]])
+    sim_time = 200
+
+    # Simulation loop
+    pos = 0
+    if __name__ == '__main__':
+        main_loop = time()  # return time in sec
+        while (ca.norm_2(state_init - state_target) > 1e-1) and (mpc_iter * h < sim_time):
+            if switch_pos == pos:
+                break
+            t1 = time()
+            args['p'] = ca.vertcat(
+                state_init,  # current state
+                state_target  # target state
+            )
+            # optimization variable current state
+            args['x0'] = ca.vertcat(
+                ca.reshape(X0, n_states * (N + 1), 1),
+                ca.reshape(u0, n_controls * N, 1)
+            )
+
+            sol = solver(
+                x0=args['x0'],
+                lbx=args['lbx'],
+                ubx=args['ubx'],
+                lbg=args['lbg'],
+                ubg=args['ubg'],
+                p=args['p']
+            )
+
+            u = ca.reshape(sol['x'][n_states * (N + 1):], n_controls, N)
+            X0 = ca.reshape(sol['x'][: n_states * (N + 1)], n_states, N + 1)
+
+            cat_states = np.dstack((
+                cat_states,
+                DM2Arr(X0)
+            ))
+
+            cat_controls = np.vstack((
+                cat_controls,
+                DM2Arr(u[:, 0])
+            ))
+            t = np.vstack((
+                t,
+                t0
+            ))
+
+            t0, state_init, u0 = shift_timestep(h, t0, state_init, u, f)
+
+            print(X0)
+            pos = int(X0[1, 1])
+            X0 = ca.horzcat(
+                X0[:, 1:],
+                ca.reshape(X0[:, -1], -1, 1)
+            )
+
+            # xx ...
+            t2 = time()
+            print(mpc_iter)
+            print(t2 - t1)
+            times = np.vstack((
+                times,
+                t2 - t1
+            ))
+
+            mpc_iter = mpc_iter + 1
+
+        main_loop_time = time()
+        ss_error = ca.norm_2(state_init - state_target)
+
+        print('\n\n')
+        print('Total time: ', main_loop_time - main_loop)
+        print('avg iteration time: ', np.array(times).mean() * 1000, 'ms')
+        print('final error: ', ss_error)
+
+        # simulate
+        #simulate(cat_states, cat_controls, times, h, N,  np.array([x_init, y_init, theta_init, x_target, y_target, theta_target]), save=False)
+        data = [X0, cat_states, cat_controls, times]
+        return data
+
+
+
+
+def Diff(x_init, y_init, theta_init, x_target, y_target, theta_target, cat_states, cat_controls,times, X0):
+
+    def shift_timestep(step_horizon, t0, state_init, u, f):
+        f_value = f(state_init, u[:, 0])
+        next_state = ca.DM.full(state_init + (step_horizon * f_value))
+
+        t0 = t0 + step_horizon
+        u0 = ca.horzcat(
+            u[:, 1:],
+            ca.reshape(u[:, -1], -1, 1)
+        )
+
+        return t0, next_state, u0
+
+    def DM2Arr(dm):
+        return np.array(dm.full())
+
+    # weights
+    Q_X = 9
+    Q_Y = 7
+    Q_theta = 1
+    R_r = 0.05
+    R_l = 0.05
+
+    # MPC CUs
+    h = 0.2
+    N = 20
+
+    # input constrains
+    omega_max = (math.pi)/4
+    omega_min = -omega_max
+    v_max = 0.6
+    v_min = -v_max
+    state_init = ca.DM([x_init, y_init, theta_init])  # initial state
+    state_target = ca.DM([x_target, y_target, theta_target])  # target state
+
+
+    # States symbols
+    x = ca.SX.sym('x')
+    y = ca.SX.sym('y')
+    theta = ca.SX.sym('theta')
+    states = ca.vertcat(x, y, theta)
+    n_states = states.numel()
+
+    # control symbols
+    v = ca.SX.sym('v')
+    omega = ca.SX.sym('omega')
+    controls = ca.vertcat(v, omega)
+    n_controls = controls.numel()
+
+    rhs = ca.vertcat(v *cos(theta), v * sin(theta), omega)
+
+    f = ca.Function('f', [states, controls], [rhs])
+    X = ca.SX.sym('X', n_states, N + 1)
+    U = ca.SX.sym('U', n_controls, N)
+    P = ca.SX.sym('P', n_states + n_states)
+
+    obj = 0
+
+    Q = ca.diagcat(Q_X, Q_Y, Q_theta)
+    R = ca.diagcat(R_r, R_l)
+
+    g = X[:, 0] - P[:n_states]
+
+    for k in range(N):
+        st = X[:, k]
+        con = U[:, k]
+        obj = obj + (st - P[n_states:]).T @ Q @ (st - P[n_states:]) + con.T @ R @ con
+        next_state = X[:, k + 1]
+        RHS = f(st, con)
+        pred_next_state = st + h * RHS
+        g = ca.vertcat(g, next_state - pred_next_state)
+
+    OPT_variables = ca.vertcat(ca.reshape(X, n_states * (N + 1), 1), ca.reshape(U, n_controls * N, 1))
+
+    nlp_prob = {'f': obj, 'x': OPT_variables, 'g': g, 'p': P}
+
+    opts = {
+        'ipopt': {
+            'max_iter': 2000,
+            'print_level': 0,
+            'acceptable_tol': 1e-8,
+            'acceptable_obj_change_tol': 1e-6
+        },
+        'print_time': 0
+    }
+
+    solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts)
+
+    lbx = ca.DM.zeros((n_states * (N + 1) + n_controls * N, 1))
+    ubx = ca.DM.zeros((n_states * (N + 1) + n_controls * N, 1))
+
+    lbx[0: n_states * (N + 1): n_states] = -ca.inf
+    lbx[1: n_states * (N + 1): n_states] = -ca.inf
+    lbx[2: n_states * (N + 1): n_states] = -ca.inf
+
+    ubx[0: n_states * (N + 1): n_states] = ca.inf
+    ubx[1: n_states * (N + 1): n_states] = ca.inf
+    ubx[2: n_states * (N + 1): n_states] = ca.inf
+
+    lbx[n_states * (N + 1)+1::2] = omega_min
+    ubx[n_states * (N + 1)+1::2] = omega_max
+    lbx[n_states * (N + 1)::2] = v_min
+    ubx[n_states * (N + 1)::2] = v_max
+
+    args = dict(lbg=ca.DM.zeros((n_states * (N + 1), 1)), ubg=ca.DM.zeros((n_states * (N + 1), 1)), lbx=lbx, ubx=ubx)
+
+    t0 = 0
+    t = ca.DM(t0)
+    u0 = ca.DM.zeros((n_controls, N))  # initial control
+
+
+    mpc_iter = 0
+    sim_time = 200
+
+    # Simulation loop
+    if __name__ == '__main__':
+        main_loop = time()  # return time in sec
+        while (ca.norm_2(state_init - state_target) > 1e-1) and (mpc_iter * h < sim_time):
+            t1 = time()
+            args['p'] = ca.vertcat(
+                state_init,  # current state
+                state_target  # target state
+            )
+            # optimization variable current state
+            args['x0'] = ca.vertcat(
+                ca.reshape(X0, n_states * (N+1), 1),
+                ca.reshape(u0, n_controls * N, 1)
+            )
+
+            sol = solver(
+                x0=args['x0'],
+                lbx=args['lbx'],
+                ubx=args['ubx'],
+                lbg=args['lbg'],
+                ubg=args['ubg'],
+                p=args['p']
+            )
+
+            u = ca.reshape(sol['x'][n_states * (N + 1):], n_controls, N)
+            X0 = ca.reshape(sol['x'][: n_states * (N + 1)], n_states, N + 1)
+
+            cat_states = np.dstack((
+                cat_states,
+                DM2Arr(X0)
+            ))
+
+            cat_controls = np.vstack((
+                cat_controls,
+                DM2Arr(u[:, 0])
+            ))
+            t = np.vstack((
+                t,
+                t0
+            ))
+
+            t0, state_init, u0 = shift_timestep(h, t0, state_init, u, f)
+
+            # print(X0)
+            X0 = ca.horzcat(
+                X0[:, 1:],
+                ca.reshape(X0[:, -1], -1, 1)
+            )
+
+            # xx ...
+            t2 = time()
+            print(mpc_iter)
+            print(t2 - t1)
+            times = np.vstack((
+                times,
+                t2 - t1
+            ))
+
+            mpc_iter = mpc_iter + 1
+
+        main_loop_time = time()
+        ss_error = ca.norm_2(state_init - state_target)
+
+        print('\n\n')
+        print('Total time: ', main_loop_time - main_loop)
+        print('avg iteration time: ', np.array(times).mean() * 1000, 'ms')
+        print('final error: ', ss_error)
+        res = [cat_states, cat_controls, times]
+        return res
+
+        # simulate
+        #simulate(cat_states, cat_controls, times, h, N,  np.array([x_init, y_init, theta_init, x_target, y_target, theta_target]), save=False)
+
+
+
+target_telta= 1
+target_x = 15
+target_y = 15
+X = Mace(0,0,0,15,15,0,12)
+Dx_init = float(X[0][0,0])
+print(Dx_init)
+Dy_init = float(X[0][1,0])
+print(Dy_init)
+Dth_init = float(X[0][2,0])
+target_theta = (arctan((15-Dy_init)/(15-Dx_init)))
+stl_x = 14/(math.tan(target_theta))
+print(tan(target_theta))
+print(stl_x)
+
+print(target_theta)
+res = Diff(Dx_init,Dy_init,Dth_init,Dx_init + stl_x,14,target_theta,X[1],X[2],X[3],X[0])
+simulate(res[0], res[1], res[2], 0.2, 20,  np.array([0, 0, 0, 15, 15,0]), save=False)
