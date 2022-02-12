@@ -1,3 +1,6 @@
+from sys import path
+path.append(r"/home/zeiros/mpc_double_model/Sim_code")
+path.append(r"/home/zeiros/casadi-linux-py38-v3.5.5-64bit")
 import casadi as ca
 from casadi import *
 import math
@@ -415,21 +418,32 @@ def Diff(x_init, y_init, theta_init, x_target, y_target, theta_target, cat_state
         #simulate(cat_states, cat_controls, times, h, N,  np.array([x_init, y_init, theta_init, x_target, y_target, theta_target]), save=False)
 
 
-
-target_telta= 1
-target_x = 15
+target_theta = 0
+target_delta= 1
+target_x = 5
 target_y = 15
-X = Mace(0,0,0,15,15,0,5)
+X = Mace(10,0,0,target_x,target_y,0,5)
 Dx_init = float(X[0][0,0])
 print(Dx_init)
 Dy_init = float(X[0][1,0])
 print(Dy_init)
 Dth_init = float(X[0][2,0])
-target_theta = (arctan((15-Dy_init)/(15-Dx_init)))
-stl_x = (14-5)/(math.tan(target_theta))
+if (target_x-Dx_init)> 0 :
+    target_theta = (arctan((target_y-Dy_init)/(target_x-Dx_init)))
+    stl_x = ((target_y - target_delta)-5)/(math.tan(target_theta))
+    res = Diff(Dx_init,Dy_init,Dth_init,Dx_init + stl_x,target_y - target_delta ,target_theta,X[1],X[2],X[3],X[0])
+elif (target_x-Dx_init)<0:
+    target_theta = math.pi - (arctan((target_y-Dy_init)/(Dx_init - target_x)))
+    stl_x = ((target_y - target_delta)-5)/(math.tan(target_theta))
+    res = Diff(Dx_init,Dy_init,Dth_init,(Dx_init - stl_x),target_y - target_delta,target_theta,X[1],X[2],X[3],X[0])
+
+
+
+
+
 print(target_theta)
 print(stl_x)
 
 print(target_theta)
 res = Diff(Dx_init,Dy_init,Dth_init,Dx_init + stl_x,14,target_theta,X[1],X[2],X[3],X[0])
-simulate(res[0], res[1], res[2], 0.2, 20,  np.array([0, 0, 0, 15, 15,0]), save=False)
+simulate(res[0], res[1], res[2], 0.2, 20,  np.array([0, 0, 0, target_x, target_y,0]), save=False)
